@@ -11,15 +11,18 @@
 class Model_GPU : public Model
 {
 private:
+	// Pinned (page-locked) host memory for fast DMA transfers
+	float3* h_positions;
+	float3* h_velocities;
 
-	std::vector<float3> positionsf3    ;
-	std::vector<float3> velocitiesf3   ;
-	std::vector<float3> accelerationsf3;
+	// Device memory
+	float3* d_positions;
+	float3* d_velocities;
+	float3* d_accelerations;
+	float*  d_masses;
 
-	float3* positionsGPU;
-	float3* velocitiesGPU;
-	float3* accelerationsGPU;
-	float*  massesGPU;
+	// Dedicated CUDA stream for async operations
+	cudaStream_t stream;
 
 public:
 	Model_GPU(const Initstate& initstate, Particles& particles);

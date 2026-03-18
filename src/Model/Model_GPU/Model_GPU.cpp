@@ -1,93 +1,119 @@
 #ifdef GALAX_MODEL_GPU
 
-#include <cmath>
 #include <iostream>
 
 #include "Model_GPU.hpp"
 #include "kernel.cuh"
 
+namespace {
 
-inline bool cuda_malloc(void ** devPtr, size_t size)
+inline void check_cuda(cudaError_t status, const char* context)
 {
-	cudaError_t cudaStatus;
-	cudaStatus = cudaMalloc(devPtr, size);
-	if (cudaStatus != cudaSuccess)
-	{
-		std::cout << "error: unable to allocate buffer" << std::endl;
-		return false;
-	}
-	return true;
+	if (status != cudaSuccess)
+		std::cerr << "CUDA error (" << context << "): "
+		          << cudaGetErrorString(status) << std::endl;
 }
 
-inline bool cuda_memcpy(void * dst, const void * src, size_t count, enum cudaMemcpyKind kind)
-{
-	cudaError_t cudaStatus;
-	cudaStatus = cudaMemcpy(dst, src, count, kind);
-	if (cudaStatus != cudaSuccess)
-	{
-		std::cout << "error: unable to copy buffer" << std::endl;
-		return false;
-	}
-	return true;
-}
-
-void update_position_gpu(float3* positionsGPU, float3* velocitiesGPU, float3* accelerationsGPU, float* massesGPU, int n_particles)
-{
-	update_position_cu(positionsGPU, velocitiesGPU, accelerationsGPU, massesGPU, n_particles);
-	cudaError_t cudaStatus;
-	cudaStatus = cudaDeviceSynchronize();
-	if (cudaStatus != cudaSuccess)
-		std::cout << "error: unable to synchronize threads" << std::endl;
-}
-
+} // namespace
 
 Model_GPU
 ::Model_GPU(const Initstate& initstate, Particles& particles)
 : Model(initstate, particles),
-  positionsf3    (n_particles),
-  velocitiesf3   (n_particles),
-  accelerationsf3(n_particles)
+  h_positions(nullptr),  h_velocities(nullptr),
+  d_positions(nullptr),  d_velocities(nullptr),
+  d_accelerations(nullptr), d_masses(nullptr),
+  stream(nullptr)
 {
-	// init cuda
-	cudaError_t cudaStatus;
+	check_cuda(cudaSetDevice(0), "set device");
+	check_cuda(cudaStreamCreate(&stream), "create stream");
 
-	cudaStatus = cudaSetDevice(0);
-	if (cudaStatus != cudaSuccess)
-		std::cout << "error: unable to setup cuda device" << std::endl;
+	// Pinned host memory enables DMA transfers (roughly 2x bandwidth
+	// over pageable memory) and is required for cudaMemcpyAsync.
+	check_cuda(cudaMallocHost(&h_positions,  n_particles * sizeof(float3)),
+	           "host alloc positions");
+	check_cuda(cudaMallocHost(&h_velocities, n_particles * sizeof(float3)),
+	           "host alloc velocities");
+
+	std::vector<float> h_masses(n_particles);
 
 	for (int i = 0; i < n_particles; i++)
 	{
-		positionsf3[i].x     = initstate.positionsx [i];
-		positionsf3[i].y     = initstate.positionsy [i];
-		positionsf3[i].z     = initstate.positionsz [i];
-		velocitiesf3[i].x    = initstate.velocitiesx[i];
-		velocitiesf3[i].y    = initstate.velocitiesy[i];
-		velocitiesf3[i].z    = initstate.velocitiesz[i];
-		accelerationsf3[i].x = 0;
-		accelerationsf3[i].y = 0;
-		accelerationsf3[i].z = 0;
+		h_positions[i]  = make_float3(initstate.positionsx [i],
+		                              initstate.positionsy [i],
+		                              initstate.positionsz [i]);
+		h_velocities[i] = make_float3(initstate.velocitiesx[i],
+		                              initstate.velocitiesy[i],
+		                              initstate.velocitiesz[i]);
+		h_masses[i] = initstate.masses[i];
 	}
 
-	cuda_malloc((void**)&positionsGPU,     n_particles * sizeof(float3));
+	// Allocate all device buffers
+	check_cuda(cudaMalloc(&d_positions,     n_particles * sizeof(float3)),
+	           "alloc d_positions");
+	check_cuda(cudaMalloc(&d_velocities,    n_particles * sizeof(float3)),
+	           "alloc d_velocities");
+	check_cuda(cudaMalloc(&d_accelerations, n_particles * sizeof(float3)),
+	           "alloc d_accelerations");
+	check_cuda(cudaMalloc(&d_masses,        n_particles * sizeof(float)),
+	           "alloc d_masses");
 
-	cuda_memcpy(positionsGPU,  positionsf3.data()     , n_particles * sizeof(float3), cudaMemcpyHostToDevice);
+	// Upload initial state to device via async copies on the stream
+	check_cuda(cudaMemcpyAsync(d_positions,  h_positions,
+	           n_particles * sizeof(float3),
+	           cudaMemcpyHostToDevice, stream), "upload positions");
+
+	check_cuda(cudaMemcpyAsync(d_velocities, h_velocities,
+	           n_particles * sizeof(float3),
+	           cudaMemcpyHostToDevice, stream), "upload velocities");
+
+	check_cuda(cudaMemcpyAsync(d_masses, h_masses.data(),
+	           n_particles * sizeof(float),
+	           cudaMemcpyHostToDevice, stream), "upload masses");
+
+	check_cuda(cudaMemsetAsync(d_accelerations, 0,
+	           n_particles * sizeof(float3), stream), "zero accelerations");
+
+	check_cuda(cudaStreamSynchronize(stream), "init sync");
 }
 
 Model_GPU
 ::~Model_GPU()
 {
-	cudaFree((void**)&positionsGPU);
+	if (stream) cudaStreamSynchronize(stream);
+
+	cudaFree(d_positions);
+	cudaFree(d_velocities);
+	cudaFree(d_accelerations);
+	cudaFree(d_masses);
+
+	cudaFreeHost(h_positions);
+	cudaFreeHost(h_velocities);
+
+	if (stream) cudaStreamDestroy(stream);
 }
 
 void Model_GPU
 ::step()
 {
-	cuda_memcpy(positionsf3.data(), positionsGPU, n_particles * sizeof(float3), cudaMemcpyDeviceToHost);
+	// Launch tiled acceleration kernel + velocity/position update on the stream.
+	// Both kernels run sequentially on the same stream (implicit ordering,
+	// no host-side sync needed between them).
+	update_position_cu(d_positions, d_velocities, d_accelerations,
+	                   d_masses, n_particles, stream);
+
+	// Async DMA of updated positions back to pinned host memory
+	check_cuda(cudaMemcpyAsync(h_positions, d_positions,
+	           n_particles * sizeof(float3),
+	           cudaMemcpyDeviceToHost, stream), "download positions");
+
+	check_cuda(cudaStreamSynchronize(stream), "step sync");
+
+	// Convert AoS float3 → SoA for the display/validation layer
 	for (int i = 0; i < n_particles; i++)
 	{
-		particles.x[i] = positionsf3[i].x;
-		particles.y[i] = positionsf3[i].y;
-		particles.z[i] = positionsf3[i].z;
+		particles.x[i] = h_positions[i].x;
+		particles.y[i] = h_positions[i].y;
+		particles.z[i] = h_positions[i].z;
 	}
 }
 
